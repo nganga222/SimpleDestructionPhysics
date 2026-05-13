@@ -1,0 +1,562 @@
+--[[ Connected Discord-GitHub
+-- Discord: redassinga
+-- Github: nganga222
+-- Roblox: UrFriendPro
+
+	-----> Put the script in: ServerScriptService/
+
+Destructible Structure Physics System
+This system provides a framework for creating destructible buildings and structures.
+It automatically detects any Model in the game named "Foundation", if you want a wall to be destroyable, the model has to be named "Foundation" and has to be
+fully anchored.
+	  
+The system utilizes a smart raycasting algorithm to automatically determine which 
+parts are the "ground" foundations, and builds a spatial structural graph 
+using spatial queries. If parts break and a section of the structure becomes 
+disconnected from the ground, gravity will take over and cause a collapse.
+]]
+
+	local RunService = game:GetService("RunService")
+	local Debris = game:GetService("Debris")
+	local CollectionService = game:GetService("CollectionService")
+	local TweenService = game:GetService("TweenService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local Workspace = game:GetService("Workspace")
+	local Players = game:GetService("Players")
+
+	local TARGET_MODEL_NAME = "Foundation"
+
+	local SystemConfig = {
+		------------------------------------
+		-- Destruction config
+		-- ---------------------------------
+		ExplosionRadius = 10,                -- How big the explosion is
+		ExplosionStrength = 8000,           -- How much force flings the parts away
+		ExplodedPartsDisappearTime = 4.5,      -- Time until the debris despawns
+
+		-- Feature Toggles
+		ClickToExplode = true,     -- Allows clicking on ANY part of a structure to explode it
+		ShowDebugGraph = false,    -- Set to true to visualize the structural connections
+		EnableParticles = true,    -- Spawns dust particles upon fracturing
+		EnableSounds = true,       -- Plays breaking sound effects
+
+		---------------------------------
+		-- Other config
+		---------------------------------
+		MinVolumeForFracture = 2,
+		MaxFractureDepth = 2,
+		DamageThreshold = 100,
+		NodeOverlapTolerance = 0.15,
+		RaycastFoundationDepth = 2
+	}
+
+	local StructureSystem = {}
+	StructureSystem.__index = StructureSystem
+
+	local Node = {}
+	Node.__index = Node
+
+	function Node.new(part, isFoundation)
+		local self = setmetatable({}, Node)
+		self.Instance = part
+		self.IsFoundation = isFoundation
+		self.Connections = {}
+		self.Health = part.Size.X * part.Size.Y * part.Size.Z * 5
+		self.MaxHealth = self.Health
+		self.Broken = false
+		self.Volume = part.Size.X * part.Size.Y * part.Size.Z
+		self.FractureDepth = 0
+		return self
+	end
+
+	function Node:AddConnection(otherNode)
+		if not table.find(self.Connections, otherNode) then
+			table.insert(self.Connections, otherNode)
+		end
+	end
+
+	function Node:RemoveConnection(otherNode)
+		local index = table.find(self.Connections, otherNode)
+		if index then
+			table.remove(self.Connections, index)
+		end
+	end
+
+	function StructureSystem.new(model)
+		local self = setmetatable({}, StructureSystem)
+		self.Model = model
+		self.Nodes = {}
+		self.NodeMap = {} 
+		self.Foundations = {}
+		self.Active = true
+		self.PendingUpdates = false
+		self.DebugFolder = nil
+
+		if SystemConfig.ShowDebugGraph then
+			self.DebugFolder = Instance.new("Folder")
+			self.DebugFolder.Name = "DebugGraph_" .. model.Name
+			self.DebugFolder.Parent = Workspace
+		end
+
+		self:InitializeGraph()
+		self:SetupClickDetectors()
+		return self
+	end
+
+	function StructureSystem:CheckIfFoundation(part)
+		-- If it hits something that is NOT in this structure (like the baseplate)
+		-- it is considered a support node.
+		local params = RaycastParams.new()
+		params.FilterDescendantsInstances = {self.Model}
+		params.FilterType = Enum.RaycastFilterType.Exclude
+
+		-- Origin at the bottom center of the part
+		local bottomCenter = part.Position - Vector3.new(0, part.Size.Y / 2, 0)
+		local direction = Vector3.new(0, -SystemConfig.RaycastFoundationDepth, 0)
+
+		local rayResult = Workspace:Raycast(bottomCenter, direction, params)
+		return rayResult ~= nil
+	end
+
+	function StructureSystem:InitializeGraph()
+		local parts = {}
+		for _, child in ipairs(self.Model:GetDescendants()) do
+			if child:IsA("BasePart") and not child:IsA("Terrain") then
+				-- Check if its anchored
+				child.Anchored = true 
+				table.insert(parts, child)
+			end
+		end
+
+		for _, part in ipairs(parts) do
+			-- Check foundation status
+			local isFoundation = self:CheckIfFoundation(part)
+			local node = Node.new(part, isFoundation)
+
+			table.insert(self.Nodes, node)
+			self.NodeMap[part] = node
+
+			if isFoundation then
+				table.insert(self.Foundations, node)
+
+				if SystemConfig.ShowDebugGraph then
+					local highlight = Instance.new("SelectionBox")
+					highlight.Adornee = part
+					highlight.Color3 = Color3.fromRGB(0, 255, 0)
+					highlight.LineThickness = 0.05
+					highlight.Parent = self.DebugFolder
+				end
+			end
+		end
+
+		-- Build connections using spatial queries
+		local overlapParams = OverlapParams.new()
+		overlapParams.FilterDescendantsInstances = {self.Model}
+		overlapParams.FilterType = Enum.RaycastFilterType.Include
+
+		for _, node in ipairs(self.Nodes) do
+			local part = node.Instance
+			local size = part.Size + Vector3.new(
+				SystemConfig.NodeOverlapTolerance, 
+				SystemConfig.NodeOverlapTolerance, 
+				SystemConfig.NodeOverlapTolerance
+			)
+			local cframe = part.CFrame
+
+			local overlapping = Workspace:GetPartBoundsInBox(cframe, size, overlapParams)
+			for _, otherPart in ipairs(overlapping) do
+				if otherPart ~= part then
+					local otherNode = self.NodeMap[otherPart]
+					if otherNode then
+						node:AddConnection(otherNode)
+
+						-- Visualize connections
+						if SystemConfig.ShowDebugGraph and not part:FindFirstChild("GraphLink_"..otherPart.Name) then
+							self:CreateDebugLink(part, otherPart)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	function StructureSystem:CreateDebugLink(partA, partB)
+		local att0 = Instance.new("Attachment", partA)
+		local att1 = Instance.new("Attachment", partB)
+		att0.Name = "GraphLink_" .. partB.Name
+		att1.Name = "GraphLink_" .. partA.Name
+
+		local beam = Instance.new("Beam")
+		beam.Attachment0 = att0
+		beam.Attachment1 = att1
+		beam.Width0 = 0.2
+		beam.Width1 = 0.2
+		beam.FaceCamera = true
+		beam.Color = ColorSequence.new(Color3.fromRGB(255, 0, 0))
+		beam.Parent = self.DebugFolder
+	end
+
+	function StructureSystem:SetupClickDetectors()
+		if not SystemConfig.ClickToExplode then return end
+
+		for _, node in ipairs(self.Nodes) do
+			local part = node.Instance
+			local clickDetector = Instance.new("ClickDetector")
+			clickDetector.MaxActivationDistance = 500
+		    clickDetector.CursorIcon = "rbxassetid://17128314434"
+			clickDetector.Parent = part
+
+			clickDetector.MouseClick:Connect(function(player)
+				print(player.Name .. " triggered an explosion at a Foundation model!")
+				_G.DestructibleSystem.CreateExplosion(part.Position, SystemConfig.ExplosionRadius, 800, SystemConfig.ExplosionStrength)
+			end)
+		end
+	end
+
+	function StructureSystem:CalculateIntegrity()
+		if not self.Active or #self.Foundations == 0 then return end
+
+		local visited = {}
+		local queue = {}
+
+		for _, foundation in ipairs(self.Foundations) do
+			if not foundation.Broken then
+				visited[foundation] = true
+				table.insert(queue, foundation)
+			end
+		end
+
+		local head = 1
+		while head <= #queue do
+			local current = queue[head]
+			head = head + 1
+
+			for _, neighbor in ipairs(current.Connections) do
+				if not visited[neighbor] and not neighbor.Broken then
+					visited[neighbor] = true
+					table.insert(queue, neighbor)
+				end
+			end
+		end
+
+		local nodesToBreak = {}
+		for _, node in ipairs(self.Nodes) do
+			if not node.Broken and not visited[node] then
+				table.insert(nodesToBreak, node)
+			end
+		end
+
+		-- Unanchor disconnected parts so they collapse
+		if #nodesToBreak > 0 then
+			for _, node in ipairs(nodesToBreak) do
+				self:CollapseNode(node)
+			end
+		end
+	end
+
+	function StructureSystem:CollapseNode(node)
+		if node.Broken then return end
+		node.Broken = true
+
+		local part = node.Instance
+		part.Anchored = false
+		part.CanCollide = true
+
+		-- Disconnect from graph
+		for _, neighbor in ipairs(node.Connections) do
+			neighbor:RemoveConnection(node)
+		end
+
+		-- Remove ClickDetector if it exists so debris isnt clickable
+		local cd = part:FindFirstChildOfClass("ClickDetector")
+		if cd then cd:Destroy() end
+
+		Debris:AddItem(part, SystemConfig.ExplodedPartsDisappearTime)
+	end
+
+	function StructureSystem:CreateVisualEffects(part)
+		if SystemConfig.EnableSounds then
+			local sound = Instance.new("Sound")
+			sound.SoundId = "rbxassetid://130964095" -- Sound
+			sound.Volume = 1
+			sound.RollOffMaxDistance = 150
+			sound.Parent = part
+			sound:Play()
+		end
+
+		if SystemConfig.EnableParticles then
+			local attachment = Instance.new("Attachment", part)
+			local particle = Instance.new("ParticleEmitter")
+			particle.Color = ColorSequence.new(part.Color)
+			particle.Size = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 2),
+				NumberSequenceKeypoint.new(1, 0)
+			})
+			particle.Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0),
+				NumberSequenceKeypoint.new(1, 1)
+			})
+			particle.Lifetime = NumberRange.new(1, 2)
+			particle.Speed = NumberRange.new(5, 15)
+			particle.SpreadAngle = Vector2.new(360, 360)
+			particle.Drag = 2
+			particle.Rate = 0
+			particle.Parent = attachment
+
+			particle:Emit(15)
+			Debris:AddItem(attachment, 3)
+		end
+	end
+
+	function StructureSystem:FracturePart(node, impactDirection, impactForce)
+		local originalPart = node.Instance
+
+		self:CreateVisualEffects(originalPart)
+
+		-- If its too small or already divided enough, just turn it into debris
+		if node.Volume < SystemConfig.MinVolumeForFracture or node.FractureDepth >= SystemConfig.MaxFractureDepth then
+			originalPart.Anchored = false
+			originalPart.CanCollide = true
+
+			if impactDirection and impactForce then
+				originalPart.Velocity = originalPart.Velocity + (impactDirection.Unit * (impactForce / originalPart.Mass))
+			end
+
+			local cd = originalPart:FindFirstChildOfClass("ClickDetector")
+			if cd then cd:Destroy() end
+
+			Debris:AddItem(originalPart, SystemConfig.ExplodedPartsDisappearTime)
+			return
+		end
+
+		-- Math to subdivide the part into 8 chunks
+		local size = originalPart.Size
+		local cframe = originalPart.CFrame
+		local halfSize = size / 2
+		local quarterSize = size / 4
+
+		local xOffsets = {-1, 1}
+		local yOffsets = {-1, 1}
+		local zOffsets = {-1, 1}
+
+		originalPart.Transparency = 1
+		originalPart.CanCollide = false
+		originalPart.Anchored = true
+
+		local cd = originalPart:FindFirstChildOfClass("ClickDetector")
+		if cd then cd:Destroy() end
+
+		for _, x in ipairs(xOffsets) do
+			for _, y in ipairs(yOffsets) do
+				for _, z in ipairs(zOffsets) do
+					local offset = Vector3.new(x * quarterSize.X, y * quarterSize.Y, z * quarterSize.Z)
+					local pieceCFrame = cframe * CFrame.new(offset)
+
+					local piece = Instance.new("Part")
+					piece.Size = halfSize
+					piece.CFrame = pieceCFrame
+					piece.Color = originalPart.Color
+					piece.Material = originalPart.Material
+					piece.Anchored = false
+					piece.CanCollide = true
+					piece.TopSurface = Enum.SurfaceType.Smooth
+					piece.BottomSurface = Enum.SurfaceType.Smooth
+					piece.Parent = Workspace
+
+					local physicalProperties = originalPart.CustomPhysicalProperties or PhysicalProperties.new(originalPart.Material)
+					piece.CustomPhysicalProperties = physicalProperties
+
+					-- Transfer velocity and apply explosive force
+					piece.Velocity = originalPart.Velocity
+					piece.RotVelocity = originalPart.RotVelocity
+
+					if impactDirection and impactForce then
+						local directionalForce = impactDirection.Unit * (impactForce / piece.Mass)
+						local randomSpread = Vector3.new(math.random(-5, 5), math.random(-5, 5), math.random(-5, 5))
+						piece.Velocity = piece.Velocity + directionalForce + randomSpread
+					end
+
+					Debris:AddItem(piece, SystemConfig.ExplodedPartsDisappearTime * math.random(80, 120) * 0.01)
+				end
+			end
+		end
+
+		Debris:AddItem(originalPart, 2)
+	end
+
+	function StructureSystem:BreakNode(node, damageSourceInfo)
+		if node.Broken then return end
+		node.Broken = true
+
+		local impactDir = damageSourceInfo and damageSourceInfo.Direction or Vector3.new(0, -1, 0)
+		local impactForce = damageSourceInfo and damageSourceInfo.Force or 50
+
+		self:FracturePart(node, impactDir, impactForce)
+
+		for _, neighbor in ipairs(node.Connections) do
+			neighbor:RemoveConnection(node)
+		end
+
+		self.PendingUpdates = true
+	end
+
+	function StructureSystem:ApplyDamage(position, radius, damage, force)
+		local hitNodes = {}
+
+		for _, node in ipairs(self.Nodes) do
+			if not node.Broken then
+				local part = node.Instance
+				local distance = (part.Position - position).Magnitude
+
+				if distance <= radius + (part.Size.Magnitude / 2) then
+					local falloff = 1 - math.clamp(distance / radius, 0, 1)
+					local appliedDamage = damage * falloff
+
+					node.Health = node.Health - appliedDamage
+
+					if node.Health <= 0 then
+						local direction = (part.Position - position)
+						if direction.Magnitude == 0 then direction = Vector3.new(0, 1, 0) end
+
+						table.insert(hitNodes, {
+							Node = node,
+							Info = {
+								Direction = direction.Unit,
+								Force = force * falloff
+							}
+						})
+					end
+				end
+			end
+		end
+
+		for _, hitData in ipairs(hitNodes) do
+			self:BreakNode(hitData.Node, hitData.Info)
+		end
+
+		if self.PendingUpdates then
+			self:CalculateIntegrity()
+			self.PendingUpdates = false
+		end
+	end
+
+	function StructureSystem:Destroy()
+		self.Active = false
+		self.Nodes = nil
+		self.NodeMap = nil
+		self.Foundations = nil
+		if self.DebugFolder then
+			self.DebugFolder:Destroy()
+		end
+	end
+
+
+	-- Global Manager
+	local GlobalStructureManager = {}
+	GlobalStructureManager.Structures = {}
+
+	function GlobalStructureManager:RegisterStructure(model)
+		if not model:IsA("Model") then return end
+
+		-- Only check models named "Foundation"
+		if model.Name ~= TARGET_MODEL_NAME then return end
+
+		local structure = StructureSystem.new(model)
+		table.insert(self.Structures, structure)
+		return structure
+	end
+
+	function GlobalStructureManager:CreateExplosion(position, radius, damage, force)
+		-- Visual effects
+		local explosion = Instance.new("Explosion")
+		explosion.Position = position
+		explosion.BlastRadius = radius
+		explosion.BlastPressure = 0 -- Handle physical velocity manually
+		explosion.DestroyJointRadiusPercent = 0
+		explosion.Parent = Workspace
+
+		-- Apply damage to all found structures
+		for _, structure in ipairs(self.Structures) do
+			if structure.Active then
+				structure:ApplyDamage(position, radius, damage, force)
+			end
+		end
+	end
+
+	function GlobalStructureManager:Init()
+		-- Scan the workspace for existing models
+		for _, instance in ipairs(Workspace:GetDescendants()) do
+			if instance:IsA("Model") and instance.Name == TARGET_MODEL_NAME then
+				self:RegisterStructure(instance)
+			end
+		end
+
+		-- Look for new models added at runtime
+		Workspace.DescendantAdded:Connect(function(instance)
+			if instance:IsA("Model") and instance.Name == TARGET_MODEL_NAME then
+				-- Wait a frame to ensure all children are loaded
+				task.defer(function()
+					self:RegisterStructure(instance)
+				end)
+			end
+		end)
+
+		RunService.Heartbeat:Connect(function(dt)
+			for _, structure in ipairs(self.Structures) do
+				if structure.Active and structure.PendingUpdates then
+					structure:CalculateIntegrity()
+					structure.PendingUpdates = false
+				end
+			end
+		end)
+	end
+
+	-- Start the system
+	GlobalStructureManager:Init()
+
+	-- EXPORTING FOR API USAGE
+	local _G_DestructibleAPI = {}
+	_G_DestructibleAPI.CreateExplosion = function(pos, rad, dmg, force)
+		GlobalStructureManager:CreateExplosion(pos, rad, dmg, force)
+	end
+	_G_DestructibleAPI.RegisterStructure = function(model)
+		return GlobalStructureManager:RegisterStructure(model)
+	end
+	_G.DestructibleSystem = _G_DestructibleAPI
+
+	------------------------------------------------
+	-- Demo setup (Builds a wall for you)
+	-- ---------------------------------------------
+	local function SetupDemo()
+		--Name the model "Foundatiom"
+		local demoStructure = Instance.new("Model")
+		demoStructure.Name = TARGET_MODEL_NAME
+		demoStructure.Parent = Workspace
+
+		-- Build brick wall
+		for y = 1, 8 do
+			for x = -6, 6 do
+				local brick = Instance.new("Part")
+				brick.Size = Vector3.new(4, 2, 2)
+				-- Start y offset at 1 so the bottom bricks touch the ground (Y=1)
+				brick.Position = Vector3.new(x * 4, (y * 2) - 1, 0)
+
+				if y % 2 == 0 then
+					brick.Position = brick.Position + Vector3.new(2, 0, 0)
+				end
+
+				-- All parts inside the "Foundation" model must be anchored
+				brick.Anchored = true 
+				brick.BrickColor = BrickColor.new("Bright red")
+				brick.Material = Enum.Material.Brick
+				brick.Parent = demoStructure
+			end
+		end
+
+		print("Demo Structure Built! Click on any brick to explode it.")
+	end
+
+	-- Uncomment to run demo: --------------------------------------------------------------------------------
+	--SetupDemo()
+
+	return GlobalStructureManager
